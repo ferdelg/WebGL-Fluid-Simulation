@@ -24,32 +24,61 @@ SOFTWARE.
 
 'use strict';
 
-// Mobile promo section
+// Flinsh boot: wait briefly for the window.flinsh bridge, restore saved
+// settings from flinsh.store, then start. Standalone (no bridge after 400 ms)
+// it starts with the defaults and does not persist anything.
 
-const promoPopup = document.getElementsByClassName('promo')[0];
-const promoPopupClose = document.getElementsByClassName('promo-close')[0];
+(function () {
+    const STORE_KEY = 'config';
+    let started = false;
+    let bridgeAtStart = false;
+    let firstFrame = false;
+    let readySent = false;
+    let app = null;
 
-if (isMobile()) {
-    setTimeout(() => {
-        promoPopup.style.display = 'table';
-    }, 20000);
-}
+    function signalReady () {
+        const bridge = window.flinsh;
+        if (!firstFrame || readySent || !bridge || typeof bridge.ready !== 'function') return;
+        readySent = true;
+        try { bridge.ready(); } catch (e) { console.warn('Fluid: flinsh.ready failed', e); }
+    }
 
-promoPopupClose.addEventListener('click', e => {
-    promoPopup.style.display = 'none';
-});
+    function loadSaved () {
+        const store = window.flinsh && window.flinsh.store;
+        if (!store) return Promise.resolve(null);
+        const timeout = new Promise(resolve => setTimeout(() => resolve(null), 1500));
+        return Promise.race([Promise.resolve().then(() => store.get(STORE_KEY)), timeout])
+            .catch(e => { console.warn('Fluid: could not load settings', e); return null; });
+    }
 
-const appleLink = document.getElementById('apple_link');
-appleLink.addEventListener('click', e => {
-    ga('send', 'event', 'link promo', 'app');
-    window.open('https://apps.apple.com/us/app/fluid-simulation/id1443124993');
-});
+    function start () {
+        if (started) return;
+        started = true;
+        bridgeAtStart = !!window.flinsh;
+        loadSaved().then(saved => {
+            app = startFluid(saved, STORE_KEY);
+            requestAnimationFrame(() => { firstFrame = true; signalReady(); });
+        });
+    }
 
-const googleLink = document.getElementById('google_link');
-googleLink.addEventListener('click', e => {
-    ga('send', 'event', 'link promo', 'app');
-    window.open('https://play.google.com/store/apps/details?id=games.paveldogreat.fluidsimfree');
-});
+    window.addEventListener('flinsh:ready', () => {
+        if (!started) { start(); return; }
+        signalReady();
+        // The bridge showed up after we started standalone: apply saved settings live.
+        if (!bridgeAtStart) {
+            bridgeAtStart = true;
+            loadSaved().then(saved => { if (app && saved) app.applyConfig(saved); });
+        }
+    });
+
+    if (window.flinsh) start();
+    else setTimeout(start, 400);
+})();
+
+// The original top-level simulation code, unchanged apart from the marked
+// Flinsh hooks, runs inside startFluid() so it can start after settings load.
+// (Body intentionally left at its original indentation.)
+function startFluid (savedConfig, STORE_KEY) {
 
 // Simulation section
 
@@ -106,14 +135,77 @@ const { gl, ext } = getWebGLContext(canvas);
 if (isMobile()) {
     config.DYE_RESOLUTION = 512;
 }
+applySavedConfig(savedConfig); // Flinsh: restore persisted settings
+enforceCapabilities();
+
+const gui = startGUI();
+
+function enforceCapabilities () {
 if (!ext.supportLinearFiltering) {
     config.DYE_RESOLUTION = 512;
     config.SHADING = false;
     config.BLOOM = false;
     config.SUNRAYS = false;
 }
+}
 
-startGUI();
+// --- Flinsh settings persistence -------------------------------------------
+
+function applySavedConfig (saved) {
+    if (!saved || typeof saved !== 'object') return;
+    Object.keys(config).forEach(key => {
+        if (key === 'PAUSED' || !(key in saved)) return;
+        const current = config[key];
+        const value = saved[key];
+        if (key === 'BACK_COLOR') {
+            if (value && typeof value === 'object')
+                ['r', 'g', 'b'].forEach(c => { if (typeof value[c] === 'number') current[c] = value[c]; });
+        } else if (typeof current === 'number') {
+            const n = Number(value);
+            if (isFinite(n)) config[key] = n;
+        } else if (typeof current === typeof value) {
+            config[key] = value;
+        }
+    });
+}
+
+let saveTimer = null;
+let saving = Promise.resolve();
+
+function scheduleConfigSave () {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(flushConfigSave, 300);
+}
+
+function flushConfigSave () {
+    clearTimeout(saveTimer);
+    saveTimer = null;
+    const store = window.flinsh && window.flinsh.store;
+    if (!store) return;
+    const snapshot = JSON.parse(JSON.stringify(config));
+    delete snapshot.PAUSED;
+    saving = saving
+        .then(() => store.set(STORE_KEY, snapshot))
+        .catch(e => console.warn('Fluid: could not save settings', e));
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden && saveTimer != null) flushConfigSave();
+});
+
+function watchControllers (folder) {
+    folder.__controllers.forEach(c => {
+        if (c.object === config && c.property !== 'PAUSED') c.onChange(scheduleConfigSave);
+    });
+    Object.keys(folder.__folders).forEach(name => watchControllers(folder.__folders[name]));
+}
+
+function refreshControllers (folder) {
+    folder.__controllers.forEach(c => c.updateDisplay());
+    Object.keys(folder.__folders).forEach(name => refreshControllers(folder.__folders[name]));
+}
+
+// ---------------------------------------------------------------------------
 
 function getWebGLContext (canvas) {
     const params = { alpha: true, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false };
@@ -152,8 +244,6 @@ function getWebGLContext (canvas) {
         formatRG = getSupportedFormat(gl, gl.RGBA, gl.RGBA, halfFloatTexType);
         formatR = getSupportedFormat(gl, gl.RGBA, gl.RGBA, halfFloatTexType);
     }
-
-    ga('send', 'event', isWebGL2 ? 'webgl2' : 'webgl', formatRGBA == null ? 'not supported' : 'supported');
 
     return {
         gl,
@@ -236,48 +326,12 @@ function startGUI () {
     captureFolder.add(config, 'TRANSPARENT').name('transparent');
     captureFolder.add({ fun: captureScreenshot }, 'fun').name('take screenshot');
 
-    let github = gui.add({ fun : () => {
-        window.open('https://github.com/PavelDoGreat/WebGL-Fluid-Simulation');
-        ga('send', 'event', 'link button', 'github');
-    } }, 'fun').name('Github');
-    github.__li.className = 'cr function bigFont';
-    github.__li.style.borderLeft = '3px solid #8C8C8C';
-    let githubIcon = document.createElement('span');
-    github.domElement.parentElement.appendChild(githubIcon);
-    githubIcon.className = 'icon github';
-
-    let twitter = gui.add({ fun : () => {
-        ga('send', 'event', 'link button', 'twitter');
-        window.open('https://twitter.com/PavelDoGreat');
-    } }, 'fun').name('Twitter');
-    twitter.__li.className = 'cr function bigFont';
-    twitter.__li.style.borderLeft = '3px solid #8C8C8C';
-    let twitterIcon = document.createElement('span');
-    twitter.domElement.parentElement.appendChild(twitterIcon);
-    twitterIcon.className = 'icon twitter';
-
-    let discord = gui.add({ fun : () => {
-        ga('send', 'event', 'link button', 'discord');
-        window.open('https://discordapp.com/invite/CeqZDDE');
-    } }, 'fun').name('Discord');
-    discord.__li.className = 'cr function bigFont';
-    discord.__li.style.borderLeft = '3px solid #8C8C8C';
-    let discordIcon = document.createElement('span');
-    discord.domElement.parentElement.appendChild(discordIcon);
-    discordIcon.className = 'icon discord';
-
-    let app = gui.add({ fun : () => {
-        ga('send', 'event', 'link button', 'app');
-        window.open('http://onelink.to/5b58bn');
-    } }, 'fun').name('Check out mobile app');
-    app.__li.className = 'cr function appBigFont';
-    app.__li.style.borderLeft = '3px solid #00FF7F';
-    let appIcon = document.createElement('span');
-    app.domElement.parentElement.appendChild(appIcon);
-    appIcon.className = 'icon app';
+    watchControllers(gui); // Flinsh: persist settings on change
 
     if (isMobile())
         gui.close();
+
+    return gui;
 }
 
 function isMobile () {
@@ -1644,3 +1698,16 @@ function hashCode (s) {
     }
     return hash;
 };
+
+// Flinsh: lets the boot code apply settings that arrive after a standalone start.
+return {
+    applyConfig (saved) {
+        applySavedConfig(saved);
+        enforceCapabilities();
+        updateKeywords();
+        initFramebuffers();
+        refreshControllers(gui);
+    }
+};
+
+} // end startFluid
